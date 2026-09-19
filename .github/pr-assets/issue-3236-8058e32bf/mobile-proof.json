@@ -1,0 +1,26 @@
+{
+  "codeSHA": "8058e32bf71bc94adf2ae9b00245afad42fa1a2b",
+  "session": "ses_f446979beffeHXcQpM3DGVwsfc",
+  "plan": {
+    "providerID": "review",
+    "modelID": "planner"
+  },
+  "build": {
+    "providerID": "review",
+    "modelID": "builder"
+  },
+  "metadataSeen": true,
+  "heldParts": 1,
+  "after": {
+    "agent": "build",
+    "model": "builder",
+    "source": "manual"
+  },
+  "removal": {
+    "agent": "build",
+    "model": "builder",
+    "source": "manual"
+  },
+  "noAssistantMessages": true,
+  "capturedAt": "2026-09-19T21:33:27.746Z"
+}
