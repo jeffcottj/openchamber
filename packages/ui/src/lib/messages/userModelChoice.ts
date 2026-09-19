@@ -1,9 +1,11 @@
 import type { Message, Part } from '@opencode-ai/sdk/v2'
 
 import { isFullySyntheticMessage } from './synthetic'
+import { compareMessagesChronologically } from '@/sync/message-ordering'
 
-type UserModelChoice = {
+export type UserModelChoice = {
   id: string
+  time: { created: number }
   agent?: string
   providerID?: string
   modelID?: string
@@ -39,7 +41,7 @@ export const extractUserModelChoice = (message: MessageLike): UserModelChoice | 
     ? variantCandidate
     : undefined
 
-  return { id: message.id, agent, providerID, modelID, variant }
+  return { id: message.id, time: { created: message.time.created }, agent, providerID, modelID, variant }
 }
 
 /**
@@ -79,23 +81,20 @@ export const findLatestUserModelChoice = (
 
 /**
  * When the user has a manual session model override, initial history and late
- * metadata updates to the same user message must not overwrite it. A different
- * message ID is authoritative only while the previously reconciled message is
- * still present; otherwise the candidate may be older history exposed by a
- * failed-send rollback or message removal.
+ * metadata updates to the same user message must not overwrite it. Chronology
+ * distinguishes a new prompt from older history exposed by removal, even when
+ * the previously reconciled prompt has paged out of the loaded message bucket.
  */
 export const shouldPreserveManualModelOverride = ({
   selectionSource,
   savedSessionModel,
-  previousMessageId,
-  previousMessageStillPresent,
+  previousMessage,
   candidate,
 }: {
   selectionSource: 'auto' | 'manual' | undefined
   savedSessionModel: { providerId: string; modelId: string } | null | undefined
-  previousMessageId: string | null | undefined
-  previousMessageStillPresent: boolean
-  candidate: Pick<UserModelChoice, 'id' | 'providerID' | 'modelID'> | null | undefined
+  previousMessage: Pick<UserModelChoice, 'id' | 'time'> | null | undefined
+  candidate: Pick<UserModelChoice, 'id' | 'time' | 'providerID' | 'modelID'> | null | undefined
 }): boolean => {
   if (selectionSource !== 'manual' || !savedSessionModel?.providerId || !savedSessionModel.modelId) {
     return false
@@ -103,9 +102,31 @@ export const shouldPreserveManualModelOverride = ({
   if (!candidate?.providerID || !candidate.modelID) {
     return true
   }
-  if (previousMessageId && candidate.id !== previousMessageId) {
-    return !previousMessageStillPresent
+  if (previousMessage && candidate.id !== previousMessage.id) {
+    return compareMessagesChronologically(candidate, previousMessage) <= 0
   }
   return savedSessionModel.providerId !== candidate.providerID
     || savedSessionModel.modelId !== candidate.modelID
+}
+
+export type LoadedUserChoiceRestore = {
+  message: Pick<UserModelChoice, 'id' | 'time'>
+  restoreKey: string
+}
+
+/** Bound component-local history, without moving its chronology backward on rollback. */
+export const rememberLoadedUserChoiceRestore = (
+  restores: Map<string, LoadedUserChoiceRestore>,
+  scope: string,
+  restore: LoadedUserChoiceRestore,
+) => {
+  const previous = restores.get(scope)
+  const message = previous && compareMessagesChronologically(previous.message, restore.message) > 0
+    ? previous.message
+    : restore.message
+  restores.delete(scope)
+  restores.set(scope, { message, restoreKey: restore.restoreKey })
+  if (restores.size <= 150) return
+  const oldestScope = restores.keys().next().value
+  if (oldestScope !== undefined) restores.delete(oldestScope)
 }

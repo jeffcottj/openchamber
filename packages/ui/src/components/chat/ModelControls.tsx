@@ -32,7 +32,7 @@ import { useContextStore } from '@/stores/contextStore';
 import { useConfigStore } from '@/stores/useConfigStore';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import { useSelectionStore } from '@/sync/selection-store';
-import { useSessionMessages, useSessionRenderable } from '@/sync/sync-context';
+import { useSessionUserModelChoice, useSessionRenderable, useSyncRuntime } from '@/sync/sync-context';
 import { useSync } from '@/sync/use-sync';
 import { useUIStore } from '@/stores/useUIStore';
 import { useModelLists } from '@/hooks/useModelLists';
@@ -45,10 +45,10 @@ import { markStartupTrace } from '@/lib/startupTrace';
 import { AUTO_MODEL_ID, AUTO_PROVIDER_ID, isAutoModel } from '@/lib/routing/autoModel';
 import { selectAutoReady, useRoutingStore } from '@/stores/useRoutingStore';
 import {
-    findLatestUserModelChoice,
+    rememberLoadedUserChoiceRestore,
+    type LoadedUserChoiceRestore,
     shouldPreserveManualModelOverride,
 } from '@/lib/messages/userModelChoice';
-import { getSyncParts } from '@/sync/sync-refs';
 import type { BtwSelection } from '@/stores/useBtwStore';
 
 type IconComponent = IconName;
@@ -316,26 +316,6 @@ type ModelControlsProps = {
     mobilePanel?: MobileControlsPanel;
     onMobilePanelChange?: (panel: MobileControlsPanel) => void;
 } & ({ selection?: never; sessionId?: never } | { selection: BtwSelection; sessionId: string | null });
-
-type LoadedUserChoiceRestore = {
-    messageId: string;
-    restoreKey: string;
-};
-
-const MAX_LOADED_USER_CHOICE_RESTORES = 150;
-
-const rememberLoadedUserChoiceRestore = (
-    restores: Map<string, LoadedUserChoiceRestore>,
-    sessionId: string,
-    restore: LoadedUserChoiceRestore,
-) => {
-    restores.delete(sessionId);
-    restores.set(sessionId, restore);
-    if (restores.size <= MAX_LOADED_USER_CHOICE_RESTORES) return;
-
-    const oldestSessionId = restores.keys().next().value;
-    if (oldestSessionId) restores.delete(oldestSessionId);
-};
 
 export const ModelControls: React.FC<ModelControlsProps> = ({
     className,
@@ -690,21 +670,16 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
     const loadedUserChoiceRestoreBySessionRef = React.useRef(new Map<string, LoadedUserChoiceRestore>());
     const restoredSessionSelectionRef = React.useRef<string | null>(null);
 
+    const { runtimeKey } = useSyncRuntime();
     const currentSessionDirectory = currentSessionId ? getDirectoryForSession(currentSessionId) : undefined;
     const hasRenderableCurrentSessionSnapshot = useSessionRenderable(
         currentSessionId ?? '',
         currentSessionDirectory ?? undefined,
     );
-    const currentSessionMessagesFromSync = useSessionMessages(currentSessionId ?? '', currentSessionDirectory ?? undefined);
-    // Skip synthetic subagent-completion nudges — restoring from them resets a
-    // manual model override back to the agent default (issue #2404).
-    const latestLoadedUserChoice = React.useMemo(() => {
-        if (selection) return null;
-        return findLatestUserModelChoice(
-            currentSessionMessagesFromSync,
-            (messageId) => getSyncParts(messageId, currentSessionDirectory ?? undefined),
-        );
-    }, [currentSessionDirectory, currentSessionMessagesFromSync, selection]);
+    const currentSessionScope = JSON.stringify([runtimeKey, currentSessionDirectory, currentSessionId]);
+    const latestLoadedUserChoice = useSessionUserModelChoice(
+        currentSessionId ?? '', currentSessionDirectory ?? undefined,
+    );
 
     const tryApplyModelSelection = React.useCallback(
         (providerId: string, modelId: string, agentName?: string): ModelApplyResult => {
@@ -913,25 +888,18 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         const restoreKey = [
             currentSessionId,
             latestLoadedUserChoice.id,
+            latestLoadedUserChoice.time.created,
             latestLoadedUserChoice.agent ?? '',
             latestLoadedUserChoice.providerID,
             latestLoadedUserChoice.modelID,
             latestLoadedUserChoice.variant ?? '',
         ].join('|');
-        const previousRestore = loadedUserChoiceRestoreBySessionRef.current.get(currentSessionId);
+        const previousRestore = loadedUserChoiceRestoreBySessionRef.current.get(currentSessionScope);
 
         if (previousRestore?.restoreKey === restoreKey) {
             return;
         }
 
-        const previousMessageStillPresent = !previousRestore
-            || previousRestore.messageId === latestLoadedUserChoice.id
-            || currentSessionMessagesFromSync.some((message) => message.id === previousRestore.messageId);
-
-        // Manual session override wins over initial history and late updates to
-        // the same message. A new real message is authoritative only while the
-        // previous message remains present, so removal cannot expose older
-        // history and roll back the selection.
         // History can never say "Auto": the server replaces the sentinel with
         // a real model before OpenCode stores the message. A saved Auto is the
         // newer truth, so it wins over the model the last turn actually ran on.
@@ -941,8 +909,8 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         if (savedSessionModel && isAutoModel(savedSessionModel.providerId, savedSessionModel.modelId)) {
             if (!autoReady) return;
             tryApplyModelSelection(AUTO_PROVIDER_ID, AUTO_MODEL_ID, currentAgentName || undefined);
-            rememberLoadedUserChoiceRestore(loadedUserChoiceRestoreBySessionRef.current, currentSessionId, {
-                messageId: latestLoadedUserChoice.id,
+            rememberLoadedUserChoiceRestore(loadedUserChoiceRestoreBySessionRef.current, currentSessionScope, {
+                message: { id: latestLoadedUserChoice.id, time: latestLoadedUserChoice.time },
                 restoreKey,
             });
             return;
@@ -952,8 +920,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         if (shouldPreserveManualModelOverride({
             selectionSource: useConfigStore.getState().selectionSource,
             savedSessionModel,
-            previousMessageId: previousRestore?.messageId,
-            previousMessageStillPresent,
+            previousMessage: previousRestore?.message,
             candidate: latestLoadedUserChoice,
         })) {
             if (savedSessionModel) {
@@ -964,8 +931,8 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                     currentAgentName || undefined,
                 );
             }
-            rememberLoadedUserChoiceRestore(loadedUserChoiceRestoreBySessionRef.current, currentSessionId, {
-                messageId: latestLoadedUserChoice.id,
+            rememberLoadedUserChoiceRestore(loadedUserChoiceRestoreBySessionRef.current, currentSessionScope, {
+                message: { id: latestLoadedUserChoice.id, time: latestLoadedUserChoice.time },
                 restoreKey,
             });
             // The saved-selections effect must still get its one-time run so the
@@ -1011,11 +978,11 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
             saveSessionAgentSelection(currentSessionId, latestLoadedUserChoice.agent);
         }
         saveSessionModelSelection(currentSessionId, latestLoadedUserChoice.providerID, latestLoadedUserChoice.modelID);
-        rememberLoadedUserChoiceRestore(loadedUserChoiceRestoreBySessionRef.current, currentSessionId, {
-            messageId: latestLoadedUserChoice.id,
+        rememberLoadedUserChoiceRestore(loadedUserChoiceRestoreBySessionRef.current, currentSessionScope, {
+            message: { id: latestLoadedUserChoice.id, time: latestLoadedUserChoice.time },
             restoreKey,
         });
-        restoredSessionSelectionRef.current = currentSessionId;
+        restoredSessionSelectionRef.current = currentSessionScope;
 
     }, [
         currentSessionId,
@@ -1023,7 +990,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         contextHydrated,
         providers,
         hasRenderableCurrentSessionSnapshot,
-        currentSessionMessagesFromSync,
+        currentSessionScope,
         latestLoadedUserChoice,
         autoReady,
         setAgent,
@@ -1045,7 +1012,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
 
         // Persisted selections hydrate a session once. Live agent changes are
         // resolved by setAgent and must not be overwritten by session history.
-        if (restoredSessionSelectionRef.current === currentSessionId) {
+        if (restoredSessionSelectionRef.current === currentSessionScope) {
             return;
         }
 
@@ -1159,7 +1126,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
 
         const savedOutcome = applySavedSelections();
         if (savedOutcome === 'resolved') {
-            restoredSessionSelectionRef.current = currentSessionId;
+            restoredSessionSelectionRef.current = currentSessionScope;
             return;
         }
         if (savedOutcome === 'waiting') {
@@ -1178,9 +1145,10 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         }
 
         applyFallbackAgent();
-        restoredSessionSelectionRef.current = currentSessionId;
+        restoredSessionSelectionRef.current = currentSessionScope;
     }, [
         currentSessionId,
+        currentSessionScope,
         hasRenderableCurrentSessionSnapshot,
         latestLoadedUserChoice,
         agents,
